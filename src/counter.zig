@@ -63,12 +63,12 @@ pub fn Counter(comptime V: type) type {
             }
 
             pub fn incrBy(self: *Impl, count: V) void {
-                m.atomicAdd(V, &self.count, count);
+                _ = @atomicRmw(V, &self.count, .Add, count, .monotonic);
             }
 
             pub fn write(self: *const Impl, writer: *std.Io.Writer) !void {
                 try writer.writeAll(self.preamble);
-                const count = m.atomicLoad(V, &self.count);
+                const count = @atomicLoad(V, &self.count, .monotonic);
                 try m.write(count, writer);
                 return writer.writeByte('\n');
             }
@@ -200,7 +200,7 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 if (gop.found_existing) {
                     MetricVec(L).free(allocator, owned_labels);
                     allocator.free(attributes);
-                    m.atomicAdd(V, &gop.value_ptr.count, count);
+                    m.atomicAddChecked(V, &gop.value_ptr.count, count);
                     return;
                 }
 

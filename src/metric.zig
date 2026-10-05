@@ -22,6 +22,22 @@ pub fn atomicAdd(comptime V: type, ptr: *V, delta: V) void {
     }
 }
 
+pub fn atomicAddChecked(comptime V: type, ptr: *V, delta: V) void {
+    switch (@typeInfo(V)) {
+        .int => {
+            var old = @atomicLoad(V, ptr, .monotonic);
+            while (true) {
+                const sum = @addWithOverflow(old, delta);
+                if (sum[1] != 0) @panic("integer overflow");
+                if (@cmpxchgWeak(V, ptr, old, sum[0], .monotonic, .monotonic) == null) break;
+                old = @atomicLoad(V, ptr, .monotonic);
+            }
+        },
+        .float => atomicAdd(V, ptr, delta),
+        else => unreachable,
+    }
+}
+
 pub fn atomicStore(comptime V: type, ptr: *V, value: V) void {
     switch (@typeInfo(V)) {
         .int => @atomicStore(V, ptr, value, .monotonic),

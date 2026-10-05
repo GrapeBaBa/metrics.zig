@@ -71,16 +71,16 @@ pub fn Gauge(comptime V: type) type {
             }
 
             pub fn incrBy(self: *Impl, value: V) void {
-                m.atomicAdd(V, &self.value, value);
+                _ = @atomicRmw(V, &self.value, .Add, value, .monotonic);
             }
 
             pub fn set(self: *Impl, value: V) void {
-                m.atomicStore(V, &self.value, value);
+                @atomicStore(V, &self.value, value, .monotonic);
             }
 
             pub fn write(self: *const Impl, writer: *std.Io.Writer) !void {
                 try writer.writeAll(self.preamble);
-                try m.write(m.atomicLoad(V, &self.value), writer);
+                try m.write(@atomicLoad(V, &self.value, .monotonic), writer);
                 return writer.writeByte('\n');
             }
         };
@@ -189,11 +189,11 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             }
 
             fn atomicIncrCallback(value: V, entry: *Value) void {
-                m.atomicAdd(V, &entry.value, value);
+                m.atomicAddChecked(V, &entry.value, value);
             }
 
             fn incrCallback(value: V, entry: *Value) void {
-                m.atomicAdd(V, &entry.value, value);
+                m.atomicAddChecked(V, &entry.value, value);
             }
 
             pub fn set(self: *Impl, labels: L, value: V) !void {
