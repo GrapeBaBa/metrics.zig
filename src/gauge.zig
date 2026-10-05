@@ -153,6 +153,15 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             lock: Io.RwLock,
             values: MetricVec(L).HashMap(Value),
 
+            const needsExclusiveValueLock = switch (@typeInfo(V)) {
+                .float => @bitSizeOf(V) > 64,
+                .int => switch (@bitSizeOf(V)) {
+                    8, 16, 32, 64 => false,
+                    else => true,
+                },
+                else => false,
+            };
+
             const Value = struct {
                 value: V,
                 attributes: []const u8,
@@ -193,7 +202,7 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             }
 
             fn incrCallback(value: V, entry: *Value) void {
-                m.atomicAddChecked(V, &entry.value, value);
+                entry.value += value;
             }
 
             pub fn set(self: *Impl, labels: L, value: V) !void {
@@ -201,7 +210,7 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             }
 
             fn setCallback(value: V, entry: *Value) void {
-                m.atomicStore(V, &entry.value, value);
+                entry.value = value;
             }
 
             fn atomicSetCallback(value: V, entry: *Value) void {
@@ -235,7 +244,8 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
                     try writer.writeAll(name);
 
                     try writer.writeAll(kv.value_ptr.attributes);
-                    try m.write(m.atomicLoad(V, &kv.value_ptr.value), writer);
+                    const current = if (needsExclusiveValueLock) kv.value_ptr.value else m.atomicLoad(V, &kv.value_ptr.value);
+                    try m.write(current, writer);
                     try writer.writeByte('\n');
                 }
             }
@@ -249,7 +259,14 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
                 const allocator = self.allocator;
                 const io = self.io;
 
-                {
+                if (needsExclusiveValueLock) {
+                    try self.lock.lock(io);
+                    defer self.lock.unlock(io);
+                    if (self.values.getPtr(labels)) |existing| {
+                        f(value, existing);
+                        return;
+                    }
+                } else {
                     try self.lock.lockShared(io);
                     defer self.lock.unlockShared(io);
                     if (self.values.getPtr(labels)) |existing| {

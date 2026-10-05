@@ -135,6 +135,15 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
             lock: std.Io.RwLock,
             values: MetricVec(L).HashMap(Value),
 
+            const needsExclusiveValueLock = switch (@typeInfo(V)) {
+                .float => @bitSizeOf(V) > 64,
+                .int => switch (@bitSizeOf(V)) {
+                    8, 16, 32, 64 => false,
+                    else => true,
+                },
+                else => false,
+            };
+
             pub const Value = struct {
                 count: V,
                 attributes: []const u8,
@@ -170,7 +179,14 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 const allocator = self.allocator;
                 const io = self.io;
 
-                {
+                if (needsExclusiveValueLock) {
+                    try self.lock.lock(io);
+                    defer self.lock.unlock(io);
+                    if (self.values.getPtr(labels)) |existing| {
+                        existing.count += count;
+                        return;
+                    }
+                } else {
                     try self.lock.lockShared(io);
                     defer self.lock.unlockShared(io);
                     if (self.values.getPtr(labels)) |existing| {
@@ -200,7 +216,11 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 if (gop.found_existing) {
                     MetricVec(L).free(allocator, owned_labels);
                     allocator.free(attributes);
-                    m.atomicAddChecked(V, &gop.value_ptr.count, count);
+                    if (needsExclusiveValueLock) {
+                        gop.value_ptr.count += count;
+                    } else {
+                        m.atomicAddChecked(V, &gop.value_ptr.count, count);
+                    }
                     return;
                 }
 
@@ -234,7 +254,8 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                     try writer.writeAll(name);
 
                     try writer.writeAll(kv.value_ptr.attributes);
-                    try m.write(m.atomicLoad(V, &kv.value_ptr.count), writer);
+                    const current = if (needsExclusiveValueLock) kv.value_ptr.count else m.atomicLoad(V, &kv.value_ptr.count);
+                    try m.write(current, writer);
                     try writer.writeByte('\n');
                 }
             }
