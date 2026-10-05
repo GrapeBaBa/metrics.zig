@@ -63,12 +63,12 @@ pub fn Counter(comptime V: type) type {
             }
 
             pub fn incrBy(self: *Impl, count: V) void {
-                _ = @atomicRmw(V, &self.count, .Add, count, .monotonic);
+                m.atomicAdd(V, &self.count, count);
             }
 
             pub fn write(self: *const Impl, writer: *std.Io.Writer) !void {
                 try writer.writeAll(self.preamble);
-                const count = @atomicLoad(V, &self.count, .monotonic);
+                const count = m.atomicLoad(V, &self.count);
                 try m.write(count, writer);
                 return writer.writeByte('\n');
             }
@@ -174,7 +174,7 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                     try self.lock.lockShared(io);
                     defer self.lock.unlockShared(io);
                     if (self.values.getPtr(labels)) |existing| {
-                        _ = @atomicRmw(V, &existing.count, .Add, count, .monotonic);
+                        m.atomicAdd(V, &existing.count, count);
                         return;
                     }
                 }
@@ -200,7 +200,7 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 if (gop.found_existing) {
                     MetricVec(L).free(allocator, owned_labels);
                     allocator.free(attributes);
-                    gop.value_ptr.count += count;
+                    m.atomicAdd(V, &gop.value_ptr.count, count);
                     return;
                 }
 
@@ -233,9 +233,8 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 while (it.next()) |kv| {
                     try writer.writeAll(name);
 
-                    const value = kv.value_ptr.*;
-                    try writer.writeAll(value.attributes);
-                    try m.write(value.count, writer);
+                    try writer.writeAll(kv.value_ptr.attributes);
+                    try m.write(m.atomicLoad(V, &kv.value_ptr.count), writer);
                     try writer.writeByte('\n');
                 }
             }
@@ -474,4 +473,26 @@ test "Counter: concurrent create" {
         const buf = writer.writer.buffered();
         try t.expectString(preamble ++ "counter_vec_concurrent{symbol=\"AAPL\",type=\"trade\"} 2\n", buf);
     }
+}
+
+test "CounterVec: concurrent increments" {
+    const Labels = struct { id: []const u8 };
+    const TestCounter = CounterVec(u64, Labels);
+    var counter = try TestCounter.init(t.allocator, t.io, "counter_vec_concurrent_increments", .{}, .{});
+    defer counter.deinit();
+
+    const labels: Labels = .{ .id = "shared" };
+    try counter.incrBy(labels, 0);
+
+    const run = struct {
+        fn run(c: *TestCounter) void {
+            for (0..10_000) |_| c.incr(.{ .id = "shared" }) catch unreachable;
+        }
+    }.run;
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, run, .{&counter});
+    for (&threads) |*thread| thread.join();
+
+    try t.expectEqual(@as(u64, 80_000), counter.impl.values.getPtr(labels).?.count);
 }
