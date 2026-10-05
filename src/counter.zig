@@ -517,3 +517,36 @@ test "CounterVec: concurrent increments" {
 
     try t.expectEqual(@as(u64, 80_000), counter.impl.values.getPtr(labels).?.count);
 }
+
+test "memory_safety: CounterVec failed insertion cleans labels" {
+    const Labels = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+    const TestCounter = CounterVec(u64, Labels);
+    const check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var counter = try TestCounter.init(allocator, t.io, "counter_vec_failed_insert", .{}, .{});
+            defer counter.deinit();
+            try counter.incr(.{ .first = "first\n", .second = "second\"" });
+        }
+    }.run;
+
+    try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
+}
+
+test "CounterVec: unsupported widths use the map lock" {
+    const Labels = struct { id: u8 };
+
+    var integer = try CounterVec(u24, Labels).init(t.allocator, t.io, "counter_vec_u24", .{}, .{});
+    defer integer.deinit();
+    try integer.incrBy(.{ .id = 1 }, 0);
+    try integer.incr(.{ .id = 1 });
+    try t.expectEqual(@as(u24, 1), integer.impl.values.getPtr(.{ .id = 1 }).?.count);
+
+    var extended = try CounterVec(f128, Labels).init(t.allocator, t.io, "counter_vec_f128", .{}, .{});
+    defer extended.deinit();
+    try extended.incrBy(.{ .id = 1 }, 0);
+    try extended.incr(.{ .id = 1 });
+    try t.expectEqual(@as(f128, 1), extended.impl.values.getPtr(.{ .id = 1 }).?.count);
+}

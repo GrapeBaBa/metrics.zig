@@ -28,7 +28,7 @@ pub fn atomicAddChecked(comptime V: type, ptr: *V, delta: V) void {
             var old = @atomicLoad(V, ptr, .monotonic);
             while (true) {
                 const sum = @addWithOverflow(old, delta);
-                if (sum[1] != 0) @panic("integer overflow");
+                if (sum[1] != 0 and std.debug.runtime_safety) @panic("integer overflow");
                 if (@cmpxchgWeak(V, ptr, old, sum[0], .monotonic, .monotonic) == null) break;
                 old = @atomicLoad(V, ptr, .monotonic);
             }

@@ -582,3 +582,19 @@ test "memory_safety: GaugeVec failed insertion cleans labels" {
 
     try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
 }
+
+test "GaugeVec: unsupported widths use the map lock" {
+    const Labels = struct { id: u8 };
+
+    var integer = try GaugeVec(i24, Labels).init(t.allocator, t.io, "gauge_vec_i24", .{}, .{});
+    defer integer.deinit();
+    try integer.set(.{ .id = 1 }, 0);
+    try integer.incr(.{ .id = 1 });
+    try t.expectEqual(@as(i24, 1), integer.impl.values.getPtr(.{ .id = 1 }).?.value);
+
+    var extended = try GaugeVec(f80, Labels).init(t.allocator, t.io, "gauge_vec_f80", .{}, .{});
+    defer extended.deinit();
+    try extended.set(.{ .id = 1 }, 0);
+    try extended.incr(.{ .id = 1 });
+    try t.expectEqual(@as(f80, 1), extended.impl.values.getPtr(.{ .id = 1 }).?.value);
+}
