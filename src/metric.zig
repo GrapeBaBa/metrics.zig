@@ -4,6 +4,64 @@ const ascii = std.ascii;
 const Wyhash = std.hash.Wyhash;
 const Allocator = std.mem.Allocator;
 
+pub fn atomicAdd(comptime V: type, ptr: *V, delta: V) void {
+    switch (@typeInfo(V)) {
+        .int => _ = @atomicRmw(V, ptr, .Add, delta, .monotonic),
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(V));
+            const bits: *Bits = @ptrCast(ptr);
+            var old_bits = @atomicLoad(Bits, bits, .monotonic);
+            while (true) {
+                const old: V = @bitCast(old_bits);
+                const new_bits: Bits = @bitCast(old + delta);
+                if (@cmpxchgWeak(Bits, bits, old_bits, new_bits, .monotonic, .monotonic) == null) break;
+                old_bits = @atomicLoad(Bits, bits, .monotonic);
+            }
+        },
+        else => unreachable,
+    }
+}
+
+pub fn atomicAddChecked(comptime V: type, ptr: *V, delta: V) void {
+    switch (@typeInfo(V)) {
+        .int => {
+            var old = @atomicLoad(V, ptr, .monotonic);
+            while (true) {
+                const sum = @addWithOverflow(old, delta);
+                if (sum[1] != 0 and std.debug.runtime_safety) @panic("integer overflow");
+                if (@cmpxchgWeak(V, ptr, old, sum[0], .monotonic, .monotonic) == null) break;
+                old = @atomicLoad(V, ptr, .monotonic);
+            }
+        },
+        .float => atomicAdd(V, ptr, delta),
+        else => unreachable,
+    }
+}
+
+pub fn atomicStore(comptime V: type, ptr: *V, value: V) void {
+    switch (@typeInfo(V)) {
+        .int => @atomicStore(V, ptr, value, .monotonic),
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(V));
+            const bits: *Bits = @ptrCast(ptr);
+            @atomicStore(Bits, bits, @bitCast(value), .monotonic);
+        },
+        else => unreachable,
+    }
+}
+
+pub fn atomicLoad(comptime V: type, ptr: *const V) V {
+    switch (@typeInfo(V)) {
+        .int => return @atomicLoad(V, ptr, .monotonic),
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(V));
+            const bits: *const Bits = @ptrCast(ptr);
+            return @bitCast(@atomicLoad(Bits, bits, .monotonic));
+        },
+        else => unreachable,
+    }
+}
+
 const MetricType = enum {
     counter,
     gauge,
@@ -84,11 +142,23 @@ pub fn MetricVec(comptime L: type) type {
         // the only type that needs to be allocated is a []const u8.
         pub fn dupe(allocator: Allocator, value: L) !L {
             var owned: L = undefined;
+            var initialized: usize = 0;
+            errdefer {
+                inline for (fields, 0..) |f, i| {
+                    if (i < initialized) {
+                        switch (@typeInfo(f.type)) {
+                            .pointer => allocator.free(@field(owned, f.name)),
+                            else => {},
+                        }
+                    }
+                }
+            }
             inline for (fields) |f| {
                 switch (@typeInfo(f.type)) {
                     .pointer => @field(owned, f.name) = try allocator.dupe(u8, @field(value, f.name)),
                     else => @field(owned, f.name) = @field(value, f.name), // all other fields are primitives
                 }
+                initialized += 1;
             }
             return owned;
         }
@@ -128,18 +198,17 @@ pub fn MetricVec(comptime L: type) type {
             // took place. This is needed so that we can properly clean up.
             var len: usize = 0;
             var serialized: SerializedValues = undefined;
+            var initialized: usize = 0;
+            defer {
+                inline for (fields, 0..) |_, i| {
+                    if (i < initialized and serialized[i].allocated) allocator.free(serialized[i].str);
+                }
+            }
             inline for (fields, 0..) |f, i| {
                 const s = try serializeValue(allocator, @field(values, f.name));
                 serialized[i] = s;
                 len += s.str.len;
-            }
-
-            // Any allocations done in serializeValue is short lived, because we'll
-            // copy everything into the final attribute string.
-            defer {
-                for (serialized) |s| {
-                    if (s.allocated) allocator.free(s.str);
-                }
+                initialized += 1;
             }
 
             var buf = try allocator.alloc(u8, static_attribute_len + len);
@@ -517,6 +586,42 @@ test "MetricVec: buildAttributes" {
         defer t.allocator.free(l);
         try t.expectString("{n=\"hello\\nworld, how's\\\\it \\\"going\\\"\"} ", l);
     }
+}
+
+test "memory_safety: MetricVec dupe cleans partial labels" {
+    const Labels = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+    const check = struct {
+        fn run(allocator: Allocator) !void {
+            const labels = try MetricVec(Labels).dupe(allocator, .{
+                .first = "first",
+                .second = "second",
+            });
+            MetricVec(Labels).free(allocator, labels);
+        }
+    }.run;
+
+    try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
+}
+
+test "memory_safety: MetricVec attributes cleans partial serialization" {
+    const Labels = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+    const check = struct {
+        fn run(allocator: Allocator) !void {
+            const attributes = try MetricVec(Labels).buildAttributes(allocator, .{
+                .first = "first\n",
+                .second = "second\"",
+            });
+            allocator.free(attributes);
+        }
+    }.run;
+
+    try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
 }
 
 test "HashContext" {

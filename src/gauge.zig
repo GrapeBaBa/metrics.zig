@@ -153,6 +153,15 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             lock: Io.RwLock,
             values: MetricVec(L).HashMap(Value),
 
+            const needsExclusiveValueLock = switch (@typeInfo(V)) {
+                .float => @bitSizeOf(V) > 64,
+                .int => switch (@bitSizeOf(V)) {
+                    8, 16, 32, 64 => false,
+                    else => true,
+                },
+                else => false,
+            };
+
             const Value = struct {
                 value: V,
                 attributes: []const u8,
@@ -189,7 +198,7 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             }
 
             fn atomicIncrCallback(value: V, entry: *Value) void {
-                entry.value += value;
+                m.atomicAddChecked(V, &entry.value, value);
             }
 
             fn incrCallback(value: V, entry: *Value) void {
@@ -205,7 +214,7 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
             }
 
             fn atomicSetCallback(value: V, entry: *Value) void {
-                entry.value = value;
+                m.atomicStore(V, &entry.value, value);
             }
 
             pub fn remove(self: *Impl, labels: L) void {
@@ -234,9 +243,9 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
                 while (it.next()) |kv| {
                     try writer.writeAll(name);
 
-                    const value = kv.value_ptr.*;
-                    try writer.writeAll(value.attributes);
-                    try m.write(value.value, writer);
+                    try writer.writeAll(kv.value_ptr.attributes);
+                    const current = if (needsExclusiveValueLock) kv.value_ptr.value else m.atomicLoad(V, &kv.value_ptr.value);
+                    try m.write(current, writer);
                     try writer.writeByte('\n');
                 }
             }
@@ -250,7 +259,14 @@ pub fn GaugeVec(comptime V: type, comptime L: type) type {
                 const allocator = self.allocator;
                 const io = self.io;
 
-                {
+                if (needsExclusiveValueLock) {
+                    try self.lock.lock(io);
+                    defer self.lock.unlock(io);
+                    if (self.values.getPtr(labels)) |existing| {
+                        f(value, existing);
+                        return;
+                    }
+                } else {
                     try self.lock.lockShared(io);
                     defer self.lock.unlockShared(io);
                     if (self.values.getPtr(labels)) |existing| {
@@ -526,4 +542,59 @@ test "Gauge: concurrent create" {
         const buf = writer.writer.buffered();
         try t.expectString(preamble ++ "gauge_vec_concurrent{symbol=\"AAPL\",type=\"trade\"} 1\n", buf);
     }
+}
+
+test "GaugeVec: concurrent increments" {
+    const Labels = struct { id: []const u8 };
+    const TestGauge = GaugeVec(u64, Labels);
+    var gauge = try TestGauge.init(t.allocator, t.io, "gauge_vec_concurrent_increments", .{}, .{});
+    defer gauge.deinit();
+
+    const labels: Labels = .{ .id = "shared" };
+    try gauge.set(labels, 0);
+
+    const run = struct {
+        fn run(g: *TestGauge) void {
+            for (0..10_000) |_| g.incr(.{ .id = "shared" }) catch unreachable;
+        }
+    }.run;
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, run, .{&gauge});
+    for (&threads) |*thread| thread.join();
+
+    try t.expectEqual(@as(u64, 80_000), gauge.impl.values.getPtr(labels).?.value);
+}
+
+test "memory_safety: GaugeVec failed insertion cleans labels" {
+    const Labels = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+    const TestGauge = GaugeVec(u64, Labels);
+    const check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var gauge = try TestGauge.init(allocator, t.io, "gauge_vec_failed_insert", .{}, .{});
+            defer gauge.deinit();
+            try gauge.incr(.{ .first = "first\n", .second = "second\"" });
+        }
+    }.run;
+
+    try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
+}
+
+test "GaugeVec: unsupported widths use the map lock" {
+    const Labels = struct { id: u8 };
+
+    var integer = try GaugeVec(i24, Labels).init(t.allocator, t.io, "gauge_vec_i24", .{}, .{});
+    defer integer.deinit();
+    try integer.set(.{ .id = 1 }, 0);
+    try integer.incr(.{ .id = 1 });
+    try t.expectEqual(@as(i24, 1), integer.impl.values.getPtr(.{ .id = 1 }).?.value);
+
+    var extended = try GaugeVec(f80, Labels).init(t.allocator, t.io, "gauge_vec_f80", .{}, .{});
+    defer extended.deinit();
+    try extended.set(.{ .id = 1 }, 0);
+    try extended.incr(.{ .id = 1 });
+    try t.expectEqual(@as(f80, 1), extended.impl.values.getPtr(.{ .id = 1 }).?.value);
 }

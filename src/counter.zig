@@ -135,6 +135,15 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
             lock: std.Io.RwLock,
             values: MetricVec(L).HashMap(Value),
 
+            const needsExclusiveValueLock = switch (@typeInfo(V)) {
+                .float => @bitSizeOf(V) > 64,
+                .int => switch (@bitSizeOf(V)) {
+                    8, 16, 32, 64 => false,
+                    else => true,
+                },
+                else => false,
+            };
+
             pub const Value = struct {
                 count: V,
                 attributes: []const u8,
@@ -170,11 +179,18 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 const allocator = self.allocator;
                 const io = self.io;
 
-                {
+                if (needsExclusiveValueLock) {
+                    try self.lock.lock(io);
+                    defer self.lock.unlock(io);
+                    if (self.values.getPtr(labels)) |existing| {
+                        existing.count += count;
+                        return;
+                    }
+                } else {
                     try self.lock.lockShared(io);
                     defer self.lock.unlockShared(io);
                     if (self.values.getPtr(labels)) |existing| {
-                        _ = @atomicRmw(V, &existing.count, .Add, count, .monotonic);
+                        m.atomicAdd(V, &existing.count, count);
                         return;
                     }
                 }
@@ -200,7 +216,11 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 if (gop.found_existing) {
                     MetricVec(L).free(allocator, owned_labels);
                     allocator.free(attributes);
-                    gop.value_ptr.count += count;
+                    if (needsExclusiveValueLock) {
+                        gop.value_ptr.count += count;
+                    } else {
+                        m.atomicAddChecked(V, &gop.value_ptr.count, count);
+                    }
                     return;
                 }
 
@@ -233,9 +253,9 @@ pub fn CounterVec(comptime V: type, comptime L: type) type {
                 while (it.next()) |kv| {
                     try writer.writeAll(name);
 
-                    const value = kv.value_ptr.*;
-                    try writer.writeAll(value.attributes);
-                    try m.write(value.count, writer);
+                    try writer.writeAll(kv.value_ptr.attributes);
+                    const current = if (needsExclusiveValueLock) kv.value_ptr.count else m.atomicLoad(V, &kv.value_ptr.count);
+                    try m.write(current, writer);
                     try writer.writeByte('\n');
                 }
             }
@@ -474,4 +494,59 @@ test "Counter: concurrent create" {
         const buf = writer.writer.buffered();
         try t.expectString(preamble ++ "counter_vec_concurrent{symbol=\"AAPL\",type=\"trade\"} 2\n", buf);
     }
+}
+
+test "CounterVec: concurrent increments" {
+    const Labels = struct { id: []const u8 };
+    const TestCounter = CounterVec(u64, Labels);
+    var counter = try TestCounter.init(t.allocator, t.io, "counter_vec_concurrent_increments", .{}, .{});
+    defer counter.deinit();
+
+    const labels: Labels = .{ .id = "shared" };
+    try counter.incrBy(labels, 0);
+
+    const run = struct {
+        fn run(c: *TestCounter) void {
+            for (0..10_000) |_| c.incr(.{ .id = "shared" }) catch unreachable;
+        }
+    }.run;
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, run, .{&counter});
+    for (&threads) |*thread| thread.join();
+
+    try t.expectEqual(@as(u64, 80_000), counter.impl.values.getPtr(labels).?.count);
+}
+
+test "memory_safety: CounterVec failed insertion cleans labels" {
+    const Labels = struct {
+        first: []const u8,
+        second: []const u8,
+    };
+    const TestCounter = CounterVec(u64, Labels);
+    const check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var counter = try TestCounter.init(allocator, t.io, "counter_vec_failed_insert", .{}, .{});
+            defer counter.deinit();
+            try counter.incr(.{ .first = "first\n", .second = "second\"" });
+        }
+    }.run;
+
+    try std.testing.checkAllAllocationFailures(t.allocator, check, .{});
+}
+
+test "CounterVec: unsupported widths use the map lock" {
+    const Labels = struct { id: u8 };
+
+    var integer = try CounterVec(u24, Labels).init(t.allocator, t.io, "counter_vec_u24", .{}, .{});
+    defer integer.deinit();
+    try integer.incrBy(.{ .id = 1 }, 0);
+    try integer.incr(.{ .id = 1 });
+    try t.expectEqual(@as(u24, 1), integer.impl.values.getPtr(.{ .id = 1 }).?.count);
+
+    var extended = try CounterVec(f128, Labels).init(t.allocator, t.io, "counter_vec_f128", .{}, .{});
+    defer extended.deinit();
+    try extended.incrBy(.{ .id = 1 }, 0);
+    try extended.incr(.{ .id = 1 });
+    try t.expectEqual(@as(f128, 1), extended.impl.values.getPtr(.{ .id = 1 }).?.count);
 }
